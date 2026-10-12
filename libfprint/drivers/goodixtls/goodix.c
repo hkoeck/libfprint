@@ -85,7 +85,12 @@ goodix_receive_done(FpDevice *dev, guint8 *data, guint16 length, GError *error)
   gpointer user_data = priv->user_data;
 
   if (!(priv->ack || priv->reply))
-    return;
+    {
+      /* No pending command takes ownership: drop the error instead of
+       * leaking it. */
+      g_clear_error (&error);
+      return;
+    }
 
   goodix_reset_state(dev);
   if (!error)
@@ -1184,7 +1189,8 @@ goodix_tls_ready(GoodixTlsServer *server, GError *err, gpointer dev)
 {
   if (err)
     {
-      fp_err("failed to init tls server: %s, code: %d", err->message, err->code);
+      fp_err ("failed to init tls server: %s, code: %d",
+              err->message ? err->message : "unknown", err->code);
       return;
     }
   goodix_send_request_tls_connection(FP_DEVICE(dev), on_goodix_request_tls_connection,
@@ -1209,8 +1215,9 @@ goodix_tls_init(FpDevice *dev, GoodixNoneCallback callback, gpointer user_data)
   GError *err = NULL;
   if (!goodix_tls_server_init(priv->tls_hop, &err))
     {
-      fp_err("failed to init tls server: %s (code: %d)", err->message, err->code);
-      g_clear_pointer(&priv->tls_hop, g_free);
+      fp_err ("failed to init tls server: %s (code: %d)",
+              err ? err->message : "unknown", err ? err->code : -1);
+      g_clear_pointer (&priv->tls_hop, g_free);
 
       /* Invoke the ready callback with the error so the calling SSM
        * is not left hanging.  Then free the callback info. */
