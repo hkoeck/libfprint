@@ -1177,6 +1177,12 @@ verify_run_state (FpiSsm *ssm, FpDevice *dev)
       fpi_device_report_finger_status_changes (dev,
                                                FP_FINGER_STATUS_NEEDED,
                                                FP_FINGER_STATUS_NONE);
+      /* Report the match as soon as the image is captured instead of after
+       * the finger is lifted: skip the blocking FDT_UP wait in the scan SSM
+       * (fire-and-forget, like the last enroll scan). The sensor's finger
+       * detect is edge-triggered, so the next verify still waits for a fresh
+       * press; the PIN/password path is unaffected. */
+      priv->last_scan = TRUE;
       g_clear_object (&priv->last_image);
       fpi_ssm_start_subsm (ssm,
                            fpi_ssm_new (dev, scan_run_state, SCAN_STAGE_NUM));

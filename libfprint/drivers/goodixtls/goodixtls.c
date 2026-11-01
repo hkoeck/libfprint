@@ -107,15 +107,35 @@ tls_push_func(gnutls_transport_ptr_t ptr, const void *buf, size_t len)
 /* PSK callback                                                                */
 /* -------------------------------------------------------------------------- */
 
+/* Path to the 32-byte raw TLS PSK provisioned for this sensor. When the sensor
+ * was provisioned by the stock vendor driver (rather than reflashed with the
+ * all-zeros factory PSK), the real key is placed here, root-only (chmod 600). */
+#define GOODIX_PSK_FILE "/etc/goodix-fp/psk.bin"
+
 static int
 tls_psk_server_cb(gnutls_session_t session, const char *username, gnutls_datum_t *key)
 {
-  key->data = gnutls_malloc(sizeof(goodix_tls_psk));
+  guint8 psk[sizeof(goodix_tls_psk)];
+  g_autofree gchar *data = NULL;
+  gsize len = 0;
+
+  memcpy(psk, goodix_tls_psk, sizeof(psk));
+  if (g_file_get_contents(GOODIX_PSK_FILE, &data, &len, NULL))
+    {
+      if (len == sizeof(psk))
+        memcpy(psk, data, sizeof(psk));
+      else
+        fp_warn("%s must be %zu bytes (got %zu); using factory PSK",
+                GOODIX_PSK_FILE, sizeof(psk), (size_t)len);
+      memset(data, 0, len);
+    }
+
+  key->data = gnutls_malloc(sizeof(psk));
   if (!key->data)
     return GNUTLS_E_MEMORY_ERROR;
 
-  memcpy(key->data, goodix_tls_psk, sizeof(goodix_tls_psk));
-  key->size = sizeof(goodix_tls_psk);
+  memcpy(key->data, psk, sizeof(psk));
+  key->size = sizeof(psk);
   return 0;
 }
 
