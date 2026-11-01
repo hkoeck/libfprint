@@ -1073,9 +1073,20 @@ on_tls_successfully_established(FpDevice *dev, gpointer user_data, GError *error
   fp_dbg("HANDSHAKE DONE");
   FpiDeviceGoodixTls *self = FPI_DEVICE_GOODIXTLS(dev);
   FpiDeviceGoodixTlsPrivate *priv = fpi_device_goodixtls_get_instance_private(self);
-  ((GoodixNoneCallback)priv->tls_ready_callback->callback)(
-      dev, priv->tls_ready_callback->user_data, NULL);
-  g_clear_pointer(&priv->tls_ready_callback, g_free);
+  GoodixCallbackInfo *callback = g_steal_pointer(&priv->tls_ready_callback);
+
+  /* This command normally ends in its 10 ms timeout, so only a cancellation
+   * is a real error here; dropping it would send the SSM on to FDT_DOWN. */
+  if (error && !g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
+    g_clear_error(&error);
+
+  if (callback)
+    {
+      ((GoodixNoneCallback)callback->callback)(dev, callback->user_data, error);
+      g_free(callback);
+    }
+  else
+    g_clear_error(&error);
 }
 static void
 tls_handshake_done(FpiSsm *ssm, FpDevice *dev, GError *error)

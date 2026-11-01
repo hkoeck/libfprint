@@ -99,6 +99,52 @@ test_tls_failure (void)
   g_assert_cmpuint (calls, ==, 1);
 }
 
+typedef struct
+{
+  guint   calls;
+  GError *error;
+} TlsReadyResult;
+
+static void
+tls_ready (FpDevice *dev, gpointer user_data, GError *error)
+{
+  TlsReadyResult *result = user_data;
+
+  result->calls++;
+  g_clear_error (&result->error);
+  result->error = error;
+}
+
+static void
+test_tls_established (gconstpointer user_data)
+{
+  g_autoptr(FpDevice) dev = g_object_new (test_goodix_device_get_type (), NULL);
+  FpiDeviceGoodixTlsPrivate *priv = fpi_device_goodixtls_get_instance_private (
+      FPI_DEVICE_GOODIXTLS (dev));
+  gboolean cancel = GPOINTER_TO_INT (user_data);
+  TlsReadyResult result = { 0 };
+
+  /* State left by goodix_send_tls_successfully_established(): waiting for an
+   * ACK that never comes, so it normally completes through its 10 ms timeout. */
+  priv->tls_ready_callback = goodix_make_cb_info (G_CALLBACK (tls_ready), &result);
+  priv->ack = TRUE;
+  priv->callback = goodix_receive_none;
+  priv->user_data = goodix_make_cb_info (G_CALLBACK (on_tls_successfully_established), NULL);
+
+  if (cancel)
+    goodix_cancel_pending_command (dev);
+  else
+    goodix_receive_timeout_cb (dev, NULL);
+
+  g_assert_cmpuint (result.calls, ==, 1);
+  g_assert_null (priv->tls_ready_callback);
+  if (cancel)
+    g_assert_error (result.error, G_IO_ERROR, G_IO_ERROR_CANCELLED);
+  else
+    g_assert_no_error (result.error);
+  g_clear_error (&result.error);
+}
+
 int
 main (int argc, char **argv)
 {
@@ -107,5 +153,7 @@ main (int argc, char **argv)
   g_test_add_data_func ("/goodixtls/cancel/ack", GUINT_TO_POINTER (1), test_cancel_command);
   g_test_add_data_func ("/goodixtls/cancel/reply", GUINT_TO_POINTER (2), test_cancel_command);
   g_test_add_func ("/goodixtls/tls/failure", test_tls_failure);
+  g_test_add_data_func ("/goodixtls/tls/established/timeout", GINT_TO_POINTER (FALSE), test_tls_established);
+  g_test_add_data_func ("/goodixtls/tls/established/cancel", GINT_TO_POINTER (TRUE), test_tls_established);
   return g_test_run ();
 }
