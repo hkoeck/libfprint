@@ -381,6 +381,141 @@ goodixtls5xx_squash_frame_percentile(GoodixTls5xxPix *frame, guint8 *squashed,
 }
 
 /* -------------------------------------------------------------------------
+ * goodixtls5xx_clahe_inplace:
+ *
+ * Contrast Limited Adaptive Histogram Equalisation on the squashed 8-bit
+ * frame.  The global percentile stretch above fixes the overall black and
+ * white level but leaves local contrast as the sensor delivered it, and a
+ * press sensor delivers it unevenly: the centre of the contact area is
+ * well modulated while the edges, where the finger touches with less
+ * pressure, stay washed out.  Those edges are exactly the region a probe
+ * press needs to share with the template, and FAST finds no corners in
+ * them.  CLAHE equalises each tile against its own histogram, with the
+ * per-bin clip limit keeping flat tiles from amplifying noise, and
+ * interpolates between neighbouring tile mappings so no tile seams appear.
+ *
+ * Tiles are deliberately large for an image this small (4x4 over 88x80 =
+ * 440 px per tile), so each histogram still has enough samples to mean
+ * something.
+ * ---------------------------------------------------------------------- */
+
+#define CLAHE_TILES_X 4
+#define CLAHE_TILES_Y 4
+#define CLAHE_CLIP_FACTOR 2.5f
+
+static void
+goodixtls5xx_clahe_inplace(guint8 *img, int width, int height)
+{
+  const int tw = (width + CLAHE_TILES_X - 1) / CLAHE_TILES_X;
+  const int th = (height + CLAHE_TILES_Y - 1) / CLAHE_TILES_Y;
+  guint8 lut[CLAHE_TILES_Y][CLAHE_TILES_X][256];
+
+  /* Per-tile clipped-histogram equalisation mapping */
+  for (int ty = 0; ty < CLAHE_TILES_Y; ty++)
+    {
+      for (int tx = 0; tx < CLAHE_TILES_X; tx++)
+        {
+          guint32 hist[256] = { 0 };
+          const int x0 = tx * tw, x1 = MIN (x0 + tw, width);
+          const int y0 = ty * th, y1 = MIN (y0 + th, height);
+          const int npix = (x1 - x0) * (y1 - y0);
+
+          if (npix <= 0)
+            {
+              for (int v = 0; v < 256; v++)
+                lut[ty][tx][v] = (guint8) v;
+              continue;
+            }
+
+          for (int y = y0; y < y1; y++)
+            for (int x = x0; x < x1; x++)
+              hist[img[y * width + x]]++;
+
+          /* Clip and redistribute the excess uniformly */
+          guint32 limit = (guint32) (CLAHE_CLIP_FACTOR * (float) npix / 256.0f);
+          if (limit < 1)
+            limit = 1;
+
+          guint32 excess = 0;
+          for (int v = 0; v < 256; v++)
+            if (hist[v] > limit)
+              {
+                excess += hist[v] - limit;
+                hist[v] = limit;
+              }
+          const guint32 give = excess / 256;
+          guint32 rest = excess - give * 256;
+          for (int v = 0; v < 256; v++)
+            {
+              hist[v] += give;
+              if (rest > 0)
+                {
+                  hist[v]++;
+                  rest--;
+                }
+            }
+
+          guint32 cdf = 0;
+          for (int v = 0; v < 256; v++)
+            {
+              cdf += hist[v];
+              lut[ty][tx][v] = (guint8) ((cdf * 255u) / (guint32) npix);
+            }
+        }
+    }
+
+  /* Bilinear interpolation between the four surrounding tile centres */
+  for (int y = 0; y < height; y++)
+    {
+      float fy = ((float) y + 0.5f) / (float) th - 0.5f;
+      int ty0 = (int) floorf (fy);
+      float wy = fy - (float) ty0;
+      int ty1 = ty0 + 1;
+
+      if (ty0 < 0)
+        {
+          ty0 = ty1 = 0;
+          wy = 0.0f;
+        }
+      else if (ty1 > CLAHE_TILES_Y - 1)
+        {
+          ty0 = ty1 = CLAHE_TILES_Y - 1;
+          wy = 0.0f;
+        }
+
+      for (int x = 0; x < width; x++)
+        {
+          float fx = ((float) x + 0.5f) / (float) tw - 0.5f;
+          int tx0 = (int) floorf (fx);
+          float wx = fx - (float) tx0;
+          int tx1 = tx0 + 1;
+
+          if (tx0 < 0)
+            {
+              tx0 = tx1 = 0;
+              wx = 0.0f;
+            }
+          else if (tx1 > CLAHE_TILES_X - 1)
+            {
+              tx0 = tx1 = CLAHE_TILES_X - 1;
+              wx = 0.0f;
+            }
+
+          const guint8 v = img[y * width + x];
+          const float a = (float) lut[ty0][tx0][v];
+          const float b = (float) lut[ty0][tx1][v];
+          const float c = (float) lut[ty1][tx0][v];
+          const float d = (float) lut[ty1][tx1][v];
+          const float top = a + wx * (b - a);
+          const float bot = c + wx * (d - c);
+          const float out = top + wy * (bot - top);
+
+          img[y * width + x] = (guint8) (out < 0.0f ? 0.0f : (out > 255.0f ? 255.0f : out));
+        }
+    }
+}
+
+/* -------------------------------------------------------------------------
  * goodixtls5xx_unsharp_mask_inplace:
  *
  * Unsharp mask: out = clip(boost × in − (boost−1) × blur(in)) using a
@@ -523,6 +658,7 @@ scan_on_read_img(FpDevice *dev, guint8 *data, guint16 len, gpointer ssm, GError 
   goodixtls5xx_squash_frame_percentile(raw_frame, squashed,
                                        cls->scan_height * cls->scan_width);
   g_free(raw_frame);
+  goodixtls5xx_clahe_inplace(squashed, cls->scan_width, cls->scan_height);
   goodixtls5xx_unsharp_mask_inplace(squashed, cls->scan_width, cls->scan_height);
   FpImage *img = cls->process_frame(squashed);
   g_free(squashed);
