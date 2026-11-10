@@ -25,8 +25,10 @@
 #include "drivers/goodixtls/goodix5xx.h"
 #include "sigfm.h"
 
+#include <glib/gstdio.h>
 #include <math.h>
 #include <stdio.h>
+#include <string.h>
 
 typedef struct
 {
@@ -889,6 +891,167 @@ goodix_sigfm_build_print (FpDevice    *dev,
   return TRUE;
 }
 
+/* -------------------------------------------------------------------------
+ * Adaptive template study
+ *
+ * The 21 enrolment samples are all the coverage this template will ever
+ * have: libfprint has no way for a driver to amend a print after a verify,
+ * so a press that lands outside the enrolled area keeps failing forever,
+ * however often it is accepted elsewhere. Vendor engines avoid that by
+ * folding confirmed scans back into the template, and the measured effect
+ * on this sensor family is large.
+ *
+ * Confirmed probes are therefore appended to a sidecar file next to the
+ * print, and matching considers them after the enrolled samples. Three
+ * properties keep this from drifting into a skeleton key:
+ *
+ *   - only a probe that matched an *enrolled* sample is learned, never one
+ *     that only matched another learned sample, so every stored sample is
+ *     one hop from the enrolment,
+ *   - the score has to clear GOODIX_LEARN_MIN_SCORE, well above the accept
+ *     threshold, not merely pass,
+ *   - at most GOODIX_LEARN_MAX_SAMPLES are kept, oldest evicted first, and
+ *     the file is tied to the enrolment by a digest so that re-enrolling
+ *     discards everything learned about the old template.
+ * ---------------------------------------------------------------------- */
+
+#define GOODIX_LEARN_MAGIC          "GXL1"
+#define GOODIX_LEARN_VERSION        1
+#define GOODIX_LEARN_MIN_SCORE      (GOODIX_SIGFM_THRESHOLD + 3)
+#define GOODIX_LEARN_MAX_SAMPLES    16
+#define GOODIX_LEARN_STORAGE_ROOT   "/var/lib/fprint"
+#define GOODIX_LEARN_TAG_LEN        64 /* sha256, hex */
+
+static gchar *
+goodix_learn_path (FpDevice *dev, FpPrint *print)
+{
+  const gchar *user = fp_print_get_username (print);
+  const gchar *driver = fp_device_get_driver (dev);
+  const gchar *devid = fp_device_get_device_id (dev);
+
+  if (!user || !*user || !driver || !devid)
+    return NULL;
+
+  /* Refuse anything that could climb out of the storage root. */
+  if (strchr (user, '/') || strchr (devid, '/'))
+    return NULL;
+
+  return g_strdup_printf ("%s/%s/%s/%s/%d.learned", GOODIX_LEARN_STORAGE_ROOT,
+                          user, driver, devid, (int) fp_print_get_finger (print));
+}
+
+/* Digest of the enrolment, so learned data cannot outlive its template. */
+static gchar *
+goodix_learn_tag (GVariant *enrolled_data)
+{
+  g_autoptr(GBytes) bytes = g_variant_get_data_as_bytes (enrolled_data);
+  gsize len = 0;
+  const guchar *data = g_bytes_get_data (bytes, &len);
+
+  return g_compute_checksum_for_data (G_CHECKSUM_SHA256, data, len);
+}
+
+static GPtrArray *
+goodix_learn_load (const gchar *path, const gchar *tag)
+{
+  g_autofree gchar *buf = NULL;
+  gsize len = 0;
+  GPtrArray *out;
+  gsize off;
+  guint32 count;
+
+  if (!path || !g_file_get_contents (path, &buf, &len, NULL))
+    return NULL;
+
+  if (len < 4 + 1 + GOODIX_LEARN_TAG_LEN + 4)
+    return NULL;
+  if (memcmp (buf, GOODIX_LEARN_MAGIC, 4) != 0 || (guint8) buf[4] != GOODIX_LEARN_VERSION)
+    return NULL;
+  if (memcmp (buf + 5, tag, GOODIX_LEARN_TAG_LEN) != 0)
+    {
+      fp_dbg ("learned samples belong to a different enrolment, ignoring");
+      return NULL;
+    }
+
+  off = 5 + GOODIX_LEARN_TAG_LEN;
+  memcpy (&count, buf + off, 4);
+  count = GUINT32_FROM_LE (count);
+  off += 4;
+
+  if (count > GOODIX_LEARN_MAX_SAMPLES)
+    return NULL;
+
+  out = g_ptr_array_new_with_free_func ((GDestroyNotify) g_bytes_unref);
+  for (guint32 i = 0; i < count; i++)
+    {
+      guint32 blen;
+
+      if (off + 4 > len)
+        break;
+      memcpy (&blen, buf + off, 4);
+      blen = GUINT32_FROM_LE (blen);
+      off += 4;
+      if (blen == 0 || off + blen > len)
+        break;
+      g_ptr_array_add (out, g_bytes_new (buf + off, blen));
+      off += blen;
+    }
+
+  return out;
+}
+
+static void
+goodix_learn_append (const gchar *path, const gchar *tag, GPtrArray *existing,
+                     const guchar *blob, gsize blob_len)
+{
+  g_autoptr(GByteArray) file = g_byte_array_new ();
+  g_autofree gchar *dir = g_path_get_dirname (path);
+  guint first;
+  guint32 count32, len32;
+  guint kept;
+
+  if (!g_file_test (dir, G_FILE_TEST_IS_DIR))
+    return; /* print storage not where we expect it - stay out of the way */
+
+  /* Oldest first out once the ring is full; the new sample always fits. */
+  first = 0;
+  if (existing && existing->len + 1 > GOODIX_LEARN_MAX_SAMPLES)
+    first = existing->len + 1 - GOODIX_LEARN_MAX_SAMPLES;
+  kept = (existing ? existing->len : 0) - first;
+
+  g_byte_array_append (file, (const guint8 *) GOODIX_LEARN_MAGIC, 4);
+  g_byte_array_append (file, (const guint8 *) &(guint8) { GOODIX_LEARN_VERSION }, 1);
+  g_byte_array_append (file, (const guint8 *) tag, GOODIX_LEARN_TAG_LEN);
+
+  count32 = GUINT32_TO_LE (kept + 1);
+  g_byte_array_append (file, (const guint8 *) &count32, 4);
+
+  for (guint i = first; existing && i < existing->len; i++)
+    {
+      gsize elen = 0;
+      const guint8 *edata = g_bytes_get_data (g_ptr_array_index (existing, i), &elen);
+
+      len32 = GUINT32_TO_LE ((guint32) elen);
+      g_byte_array_append (file, (const guint8 *) &len32, 4);
+      g_byte_array_append (file, edata, elen);
+    }
+
+  len32 = GUINT32_TO_LE ((guint32) blob_len);
+  g_byte_array_append (file, (const guint8 *) &len32, 4);
+  g_byte_array_append (file, blob, blob_len);
+
+  /* g_file_set_contents writes a temporary file and renames it. */
+  if (!g_file_set_contents (path, (const gchar *) file->data, file->len, NULL))
+    {
+      fp_warn ("could not store learned sample at %s", path);
+      return;
+    }
+  if (g_chmod (path, 0600) != 0)
+    fp_warn ("could not restrict permissions on %s", path);
+
+  fp_dbg ("learned a new sample, %u stored", kept + 1);
+}
+
 static FpiMatchResult
 goodix_sigfm_compare (FpDevice   *dev,
                       FpPrint    *enrolled,
@@ -903,6 +1066,10 @@ goodix_sigfm_compare (FpDevice   *dev,
   const guchar *probe_blob;
   SigfmImgInfo *probe_info;
   FpiMatchResult result = FPI_MATCH_FAIL;
+  gint enrolled_score = -1;
+  gchar *learn_path = NULL;
+  gchar *learn_tag = NULL;
+  GPtrArray *learned = NULL;
 
   g_object_get (enrolled, "fpi-data", &enrolled_data, NULL);
   g_object_get (probe, "fpi-data", &probe_data, NULL);
@@ -971,12 +1138,53 @@ goodix_sigfm_compare (FpDevice   *dev,
         if (score >= GOODIX_SIGFM_THRESHOLD)
           {
             result = FPI_MATCH_SUCCESS;
+            enrolled_score = score;
             g_variant_unref (entry);
             break;
           }
         g_variant_unref (entry);
       }
   }
+
+  /* Samples learned from earlier confirmed presses, tried after the
+   * enrolment and never used as a source for further learning. */
+  learn_path = goodix_learn_path (dev, enrolled);
+  learn_tag = goodix_learn_tag (enrolled_data);
+  learned = goodix_learn_load (learn_path, learn_tag);
+
+  if (result != FPI_MATCH_SUCCESS && learned)
+    {
+      for (guint i = 0; i < learned->len; i++)
+        {
+          gsize llen = 0;
+          const guint8 *lblob = g_bytes_get_data (g_ptr_array_index (learned, i), &llen);
+          SigfmImgInfo *linfo = sigfm_deserialize_binary (lblob, llen);
+          gint score;
+
+          if (!linfo)
+            continue;
+
+          score = sigfm_match_score (linfo, probe_info);
+          sigfm_free_info (linfo);
+          fp_dbg ("sigfm score %d/%d (learned %u)", score, GOODIX_SIGFM_THRESHOLD, i);
+
+          if (score >= GOODIX_SIGFM_THRESHOLD)
+            {
+              result = FPI_MATCH_SUCCESS;
+              break;
+            }
+        }
+    }
+
+  /* Study: only a probe confirmed by the enrolment itself, and only with a
+   * clear margin, is folded in. */
+  if (result == FPI_MATCH_SUCCESS && enrolled_score >= GOODIX_LEARN_MIN_SCORE &&
+      fpi_device_get_current_action (dev) == FPI_DEVICE_ACTION_VERIFY && learn_path)
+    goodix_learn_append (learn_path, learn_tag, learned, probe_blob, probe_len);
+
+  g_clear_pointer (&learned, g_ptr_array_unref);
+  g_free (learn_path);
+  g_free (learn_tag);
 
   sigfm_free_info (probe_info);
   return result;
