@@ -164,8 +164,24 @@ fast9_score(const uint8_t *img, int w, int x, int y, int threshold)
 #define FAST_THRESHOLD 10
 #define FAST_BORDER (3 + PATCH_HALF) /* avoid circle + patch OOB */
 #define FAST_BORDER_DETECT 4         /* FAST radius 3 + 1 for NMS only */
-#define MAX_KP 128
+#define MAX_KP 256
 #define MULTISCALE_DUP_DIST_SQ 16.0f /* 4px near-duplicate suppression */
+
+/* Strongest first; raster order breaks ties so the selection is deterministic. */
+static int
+cmp_kp_strength(const void *a, const void *b)
+{
+  const OrbKeypoint *ka = a;
+  const OrbKeypoint *kb = b;
+
+  if (ka->response != kb->response)
+    return ka->response > kb->response ? -1 : 1;
+  if (ka->y != kb->y)
+    return ka->y < kb->y ? -1 : 1;
+  if (ka->x != kb->x)
+    return ka->x < kb->x ? -1 : 1;
+  return 0;
+}
 
 static int
 detect_keypoints_ex(const uint8_t *img, int w, int h, OrbKeypoint *kp_out, int max_kp,
@@ -181,11 +197,21 @@ detect_keypoints_ex(const uint8_t *img, int w, int h, OrbKeypoint *kp_out, int m
         scores[y * w + x] = fast9_score(img, w, x, y, FAST_THRESHOLD);
     }
 
-  /* Pass 2: 3×3 NMS — keep only local maxima */
-  int n = 0;
-  for (int y = border; y < h - border && n < max_kp; y++)
+  /* Pass 2: 3×3 NMS — collect every local maximum.
+   *
+   * This used to stop as soon as max_kp keypoints had been written, which cut
+   * the image off at a scan line: a frame with more corners than the cap was
+   * described by its topmost corners only, whatever their strength, and the
+   * rest of the fingerprint was discarded. A template built from such frames
+   * covers only the upper part of the finger, so a press that lands lower
+   * shares almost no keypoints with it and the match score collapses. The
+   * response was already recorded per keypoint but never used to choose.
+   */
+  GArray *maxima = g_array_sized_new(FALSE, FALSE, sizeof(OrbKeypoint), max_kp);
+
+  for (int y = border; y < h - border; y++)
     {
-      for (int x = border; x < w - border && n < max_kp; x++)
+      for (int x = border; x < w - border; x++)
         {
           int s = scores[y * w + x];
           if (s == 0)
@@ -197,15 +223,30 @@ detect_keypoints_ex(const uint8_t *img, int w, int h, OrbKeypoint *kp_out, int m
                 is_max = 0;
           if (is_max)
             {
-              kp_out[n].x = (float)x;
-              kp_out[n].y = (float)y;
-              kp_out[n].response = (float)s;
-              n++;
+              OrbKeypoint kp;
+
+              kp.x = (float)x;
+              kp.y = (float)y;
+              kp.response = (float)s;
+              g_array_append_val(maxima, kp);
             }
         }
     }
 
   g_free(scores);
+
+  /* Pass 3: keep the strongest max_kp of them, spread over the whole frame */
+  int n = (int)maxima->len;
+
+  if (n > max_kp)
+    {
+      qsort(maxima->data, maxima->len, sizeof(OrbKeypoint), cmp_kp_strength);
+      n = max_kp;
+    }
+  g_debug("sigfm maxima: %u, kept %d (cap %d)", maxima->len, n, max_kp);
+  memcpy(kp_out, maxima->data, (gsize)n * sizeof(OrbKeypoint));
+  g_array_free(maxima, TRUE);
+
   return n;
 }
 
